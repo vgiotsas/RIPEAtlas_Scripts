@@ -12,9 +12,12 @@ import re
 import bz2
 import argparse
 import sys
+import csv
+import os
+import glob
 from collections import defaultdict, Counter
 from typing import List, Dict, Set, Tuple, Optional
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 import statistics
 
 
@@ -382,7 +385,240 @@ def load_traceroutes_from_bz2(filename: str) -> List[Dict]:
     return traceroutes
 
 
-def process_bz2_file(filename: str, verbose: bool = False) -> None:
+def find_bz2_files(folder_path: str) -> List[str]:
+    """Find all .bz2 files in a folder"""
+    if not os.path.isdir(folder_path):
+        print(f"Error: '{folder_path}' is not a valid directory", file=sys.stderr)
+        sys.exit(1)
+    
+    # Find all .bz2 files in the folder
+    pattern = os.path.join(folder_path, "*.bz2")
+    bz2_files = glob.glob(pattern)
+    
+    if not bz2_files:
+        print(f"Error: No .bz2 files found in '{folder_path}'", file=sys.stderr)
+        sys.exit(1)
+    
+    # Sort files for consistent processing order
+    bz2_files.sort()
+    return bz2_files
+
+
+def process_multiple_bz2_files(folder_path: str, verbose: bool = False, output_format: str = 'text', 
+                              output_file: Optional[str] = None, min_confidence: float = 0.0) -> None:
+    """Process all bz2 files in a folder containing RIPE Atlas traceroute data"""
+    
+    print(f"Finding .bz2 files in {folder_path}...")
+    bz2_files = find_bz2_files(folder_path)
+    
+    print(f"Found {len(bz2_files)} .bz2 files to process")
+    if verbose:
+        for i, filename in enumerate(bz2_files, 1):
+            print(f"  {i}. {os.path.basename(filename)}")
+    
+    # Initialize detector (will accumulate data across all files)
+    detector = CGNATDetector()
+    all_indicators = []
+    total_measurements = 0
+    total_processed = 0
+    
+    # Process each file
+    for file_idx, filename in enumerate(bz2_files, 1):
+        print(f"\nProcessing file {file_idx}/{len(bz2_files)}: {os.path.basename(filename)}")
+        
+        try:
+            # Load traceroute data from current file
+            traceroute_data = load_traceroutes_from_bz2(filename)
+            
+            if not traceroute_data:
+                print(f"  No valid traceroute data found in {os.path.basename(filename)}")
+                continue
+            
+            file_measurements = len(traceroute_data)
+            total_measurements += file_measurements
+            print(f"  Loaded {file_measurements} traceroute measurements")
+            
+            # Process traceroutes from current file
+            file_processed = 0
+            for data in traceroute_data:
+                try:
+                    traceroute = TracerouteParser.parse_atlas_json(data)
+                    indicators = detector.analyze_traceroute(traceroute)
+                    all_indicators.extend(indicators)
+                    file_processed += 1
+                    total_processed += 1
+                    
+                    if verbose and total_processed % 5000 == 0:
+                        print(f"  Processed {total_processed} total traceroutes...")
+                        
+                except Exception as e:
+                    if verbose:
+                        print(f"  Warning: Failed to process traceroute from probe {data.get('prb_id', 'unknown')}: {e}", file=sys.stderr)
+                    continue
+            
+            print(f"  Successfully processed {file_processed} traceroutes from this file")
+            
+        except Exception as e:
+            print(f"  Error processing file {os.path.basename(filename)}: {e}", file=sys.stderr)
+            continue
+    
+    print(f"\nCompleted processing {len(bz2_files)} files")
+    print(f"Total measurements loaded: {total_measurements}")
+    print(f"Total measurements processed: {total_processed}")
+    
+    # Analyze clustering across all files
+    print("Analyzing probe clustering patterns across all files...")
+    clustering_indicators = detector.analyze_probe_clustering()
+    all_indicators.extend(clustering_indicators)
+    
+    # Filter by confidence threshold
+    filtered_indicators = filter_indicators_by_confidence(all_indicators, min_confidence)
+    
+    if min_confidence > 0.0:
+        print(f"Filtered to {len(filtered_indicators)} indicators with confidence >= {min_confidence:.2f}")
+    
+    # Get summary statistics
+    stats = detector.get_summary_statistics()
+    stats['indicators_above_threshold'] = len(filtered_indicators)
+    stats['confidence_threshold'] = min_confidence
+    stats['total_files_processed'] = len(bz2_files)
+    stats['total_measurements_loaded'] = total_measurements
+    stats['total_measurements_processed'] = total_processed
+    
+    # Output results in specified format
+    if output_format == 'json':
+        output_json_format(filtered_indicators, stats, output_file)
+    elif output_format == 'csv':
+        output_csv_format(filtered_indicators, stats, output_file)
+    else:  # text format
+        output_text_format(filtered_indicators, stats, output_file)
+    """Filter indicators by minimum confidence threshold"""
+    return [indicator for indicator in indicators if indicator.confidence >= min_confidence]
+
+
+def output_text_format(indicators: List[CGNATIndicator], stats: Dict, output_file: Optional[str] = None):
+    """Output results in human-readable text format"""
+    output_lines = []
+    
+    output_lines.append("CGNAT Detection Results")
+    output_lines.append("=" * 80)
+    
+    if not indicators:
+        output_lines.append("No CGNAT indicators found above the confidence threshold.")
+    else:
+        # Group indicators by probe
+        probe_indicators = defaultdict(list)
+        for indicator in indicators:
+            probe_indicators[indicator.probe_id].append(indicator)
+        
+        # Sort probes by highest confidence indicator
+        sorted_probes = sorted(probe_indicators.items(), 
+                              key=lambda x: max(ind.confidence for ind in x[1]), 
+                              reverse=True)
+        
+        for probe_id, probe_inds in sorted_probes:
+            output_lines.append(f"\nProbe {probe_id}:")
+            for indicator in sorted(probe_inds, key=lambda x: x.confidence, reverse=True):
+                output_lines.append(f"  • {indicator.indicator_type.replace('_', ' ').title()}")
+                output_lines.append(f"    Confidence: {indicator.confidence:.2f}")
+                output_lines.append(f"    Evidence: {indicator.evidence}")
+    
+    # Add summary statistics
+    output_lines.append(f"\nSummary Statistics")
+    output_lines.append("=" * 80)
+    for key, value in stats.items():
+        if isinstance(value, float):
+            output_lines.append(f"{key.replace('_', ' ').title()}: {value:.3f}")
+        else:
+            output_lines.append(f"{key.replace('_', ' ').title()}: {value}")
+    
+    # Output to file or stdout
+    output_text = '\n'.join(output_lines)
+    if output_file:
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write(output_text)
+        print(f"Results saved to {output_file}")
+    else:
+        print(output_text)
+
+
+def output_json_format(indicators: List[CGNATIndicator], stats: Dict, output_file: Optional[str] = None):
+    """Output results in JSON format"""
+    # Convert indicators to dictionaries, handling hop_details
+    indicators_dict = []
+    for indicator in indicators:
+        indicator_dict = asdict(indicator)
+        # Convert hop_details to simple format if present
+        if indicator_dict['hop_details']:
+            indicator_dict['hop_details'] = [
+                {
+                    'hop_num': hop.hop_num,
+                    'ip_address': hop.ip_address,
+                    'rtt': hop.rtt,
+                    'hostname': hop.hostname
+                }
+                for hop in indicator.hop_details
+            ]
+        indicators_dict.append(indicator_dict)
+    
+    output_data = {
+        'cgnat_indicators': indicators_dict,
+        'summary_statistics': stats,
+        'metadata': {
+            'total_indicators': len(indicators),
+            'unique_probes_with_indicators': len(set(ind.probe_id for ind in indicators))
+        }
+    }
+    
+    # Output to file or stdout
+    json_output = json.dumps(output_data, indent=2, ensure_ascii=False)
+    if output_file:
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write(json_output)
+        print(f"Results saved to {output_file}")
+    else:
+        print(json_output)
+
+
+def output_csv_format(indicators: List[CGNATIndicator], stats: Dict, output_file: Optional[str] = None):
+    """Output results in CSV format"""
+    import io
+    
+    output = io.StringIO()
+    writer = csv.writer(output)
+    
+    # Write header
+    writer.writerow(['probe_id', 'indicator_type', 'confidence', 'evidence'])
+    
+    # Write indicators
+    for indicator in indicators:
+        writer.writerow([
+            indicator.probe_id,
+            indicator.indicator_type,
+            f"{indicator.confidence:.3f}",
+            indicator.evidence
+        ])
+    
+    # Add summary statistics as comments
+    output.write('\n# Summary Statistics\n')
+    for key, value in stats.items():
+        if isinstance(value, float):
+            output.write(f'# {key}: {value:.3f}\n')
+        else:
+            output.write(f'# {key}: {value}\n')
+    
+    # Output to file or stdout
+    csv_content = output.getvalue()
+    if output_file:
+        with open(output_file, 'w', encoding='utf-8') as f:
+            f.write(csv_content)
+        print(f"Results saved to {output_file}")
+    else:
+        print(csv_content)
+
+
+def process_bz2_file(filename: str, verbose: bool = False, output_format: str = 'text', 
+                    output_file: Optional[str] = None, min_confidence: float = 0.0) -> None:
     """Process a bz2 file containing RIPE Atlas traceroute data"""
     
     print(f"Loading traceroute data from {filename}...")
@@ -423,36 +659,24 @@ def process_bz2_file(filename: str, verbose: bool = False) -> None:
     clustering_indicators = detector.analyze_probe_clustering()
     all_indicators.extend(clustering_indicators)
     
-    # Print results
-    print("\nCGNAT Detection Results")
-    print("=" * 80)
+    # Filter by confidence threshold
+    filtered_indicators = filter_indicators_by_confidence(all_indicators, min_confidence)
     
-    # Group indicators by probe
-    probe_indicators = defaultdict(list)
-    for indicator in all_indicators:
-        probe_indicators[indicator.probe_id].append(indicator)
+    if min_confidence > 0.0:
+        print(f"Filtered to {len(filtered_indicators)} indicators with confidence >= {min_confidence:.2f}")
     
-    # Sort probes by highest confidence indicator
-    sorted_probes = sorted(probe_indicators.items(), 
-                          key=lambda x: max(ind.confidence for ind in x[1]), 
-                          reverse=True)
-    
-    for probe_id, indicators in sorted_probes:
-        print(f"\nProbe {probe_id}:")
-        for indicator in sorted(indicators, key=lambda x: x.confidence, reverse=True):
-            print(f"  • {indicator.indicator_type.replace('_', ' ').title()}")
-            print(f"    Confidence: {indicator.confidence:.2f}")
-            print(f"    Evidence: {indicator.evidence}")
-    
-    # Print summary statistics
+    # Get summary statistics
     stats = detector.get_summary_statistics()
-    print(f"\n{'Summary Statistics'}")
-    print("=" * 80)
-    for key, value in stats.items():
-        if isinstance(value, float):
-            print(f"{key.replace('_', ' ').title()}: {value:.3f}")
-        else:
-            print(f"{key.replace('_', ' ').title()}: {value}")
+    stats['indicators_above_threshold'] = len(filtered_indicators)
+    stats['confidence_threshold'] = min_confidence
+    
+    # Output results in specified format
+    if output_format == 'json':
+        output_json_format(filtered_indicators, stats, output_file)
+    elif output_format == 'csv':
+        output_csv_format(filtered_indicators, stats, output_file)
+    else:  # text format
+        output_text_format(filtered_indicators, stats, output_file)
 
 
 def main():
@@ -462,27 +686,51 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Single file processing
   python cgnat_detector.py traceroute_data.json.bz2
   python cgnat_detector.py -v large_dataset.bz2
-  python cgnat_detector.py --example  # Run with example data
+  
+  # Folder processing (all .bz2 files)
+  python cgnat_detector.py --input-folder /path/to/data/
+  python cgnat_detector.py --input-folder ./measurements/ --output json
+  
+  # Output and filtering options
+  python cgnat_detector.py --output json --output-file results.json data.bz2
+  python cgnat_detector.py --min-confidence 0.8 --output csv data.bz2
+  python cgnat_detector.py --input-folder ./data/ --min-confidence 0.9 --output-file high_conf.txt
         """
     )
     
-    parser.add_argument('input_file', nargs='?', 
-                       help='BZ2 compressed file containing RIPE Atlas traceroute data')
+    # Input options (mutually exclusive)
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument('input_file', nargs='?', 
+                           help='BZ2 compressed file containing RIPE Atlas traceroute data')
+    input_group.add_argument('--input-folder', 
+                           help='Folder containing multiple .bz2 files to process')
+    
+    # Other options
     parser.add_argument('-v', '--verbose', action='store_true',
                        help='Enable verbose output')
+    parser.add_argument('--output', choices=['text', 'json', 'csv'], 
+                       default='text', help='Output format (default: text)')
+    parser.add_argument('--output-file', 
+                       help='Save results to file instead of printing to stdout')
+    parser.add_argument('--min-confidence', type=float, default=0.0,
+                       help='Minimum confidence threshold (0.0-1.0, default: 0.0)')
     
     args = parser.parse_args()
     
-    if args.input_file:
-        # Process the specified bz2 file
-        process_bz2_file(args.input_file, args.verbose)
-    
-    else:
-        parser.print_help()
-        print("\nError: Please specify an input file or use --example")
+    # Validate confidence threshold
+    if not 0.0 <= args.min_confidence <= 1.0:
+        print("Error: --min-confidence must be between 0.0 and 1.0", file=sys.stderr)
         sys.exit(1)
+    
+    if args.input_folder:
+        # Process multiple files from folder
+        process_multiple_bz2_files(args.input_folder, args.verbose, args.output, args.output_file, args.min_confidence)
+    elif args.input_file:
+        # Process the specified bz2 file
+        process_bz2_file(args.input_file, args.verbose, args.output, args.output_file, args.min_confidence)
 
 
 if __name__ == "__main__":
