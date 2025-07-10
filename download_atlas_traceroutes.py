@@ -68,101 +68,108 @@ def fetch_and_save_results_curl(
     """
     Use `curl --http1.0` to download RIPE Atlas chunked results in JSONL format.
 
-    Each chunk is saved to a temporary file in a `. _temp_chunks` subdirectory, then appended to
-    `<out_dir>/<measurement_id>.jsonl.gz`. Retries on failure up to RETRY_LIMIT. Removes temporary files
-    when done.
+    Each chunk is saved to a temporary file in a `._temp_chunks` sub-directory.
+    Non-empty chunks are appended (gzip-compressed) to
+    `<out_dir>/<measurement_id>.jsonl.gz`.  Completely empty measurements
+    (chunks that are only “[]”) are detected and *not* preserved: any
+    zero-content file is deleted before returning.
 
     :param measurement_id: The RIPE Atlas measurement ID to fetch.
-    :type measurement_id: int
-    :param start_ts: Start of the time window as a UNIX timestamp (UTC).
-    :type start_ts: int
-    :param stop_ts: End of the time window as a UNIX timestamp (UTC).
-    :type stop_ts: int
-    :param out_dir: Directory where result files and temporary chunks are saved.
-    :type out_dir: str
-    :return: None. On success, writes a `<measurement_id>.jsonl.gz` file in out_dir.
-    :rtype: None
+    :type  measurement_id: int
+    :param start_ts:  Start of the time window (Unix UTC).
+    :param stop_ts:   End   of the time window (Unix UTC).
+    :param out_dir:   Directory where result files and temporary chunks live.
+    :return:          None.  On success, a `<id>.jsonl.gz` containing ≥1
+                      traceroute appears in *out_dir*; otherwise no file remains.
     :raises RuntimeError: If all curl attempts fail for any chunk.
     """
+
     final_fn = os.path.join(out_dir, f"{measurement_id}.jsonl.gz")
     temp_dir = os.path.join(out_dir, "._temp_chunks")
     os.makedirs(temp_dir, exist_ok=True)
 
-    if os.path.exists(final_fn):
-        print(f"⏭️ Skipping {measurement_id}, {final_fn} already exists.")
+    # Skip if a non-empty file already exists
+    if os.path.exists(final_fn) and os.path.getsize(final_fn) > 0:
+        print(f"⏭️  Skipping {measurement_id}, {final_fn} already exists.")
         return
 
+    # Clear any stale temporary chunks
     for f in os.listdir(temp_dir):
         if f.startswith(f"chunk_{measurement_id}_"):
             os.remove(os.path.join(temp_dir, f))
 
-    interval = CHUNK_DURATION * 3600
-    current = start_ts
-    chunk_index = 0
+    interval     = CHUNK_DURATION * 3600          # six-hour slices
+    current_ts   = start_ts
+    chunk_index  = 0
+    wrote_data   = False                          # gets flipped to True on first non-empty chunk
 
-    if os.path.exists(final_fn):
-        os.remove(final_fn)
-
-    while current <= stop_ts:
-        chunk_end = min(current + interval - 1, stop_ts)
-        path = (
+    while current_ts <= stop_ts:
+        chunk_end_ts  = min(current_ts + interval - 1, stop_ts)
+        api_path      = (
             f"/api/v2/measurements/{measurement_id}/results/"
-            f"?start={current}&stop={chunk_end}"
+            f"?start={current_ts}&stop={chunk_end_ts}"
         )
-        full_url = f"https://atlas.ripe.net{path}"
-        chunk_filename = os.path.join(
+        full_url      = f"https://atlas.ripe.net{api_path}"
+        chunk_fn      = os.path.join(
             temp_dir, f"chunk_{measurement_id}_{chunk_index:03d}.jsonl"
         )
-        print(f"⏳ Downloading (chunk #{chunk_index}): {full_url}")
+        print(f"⏳  Downloading (chunk #{chunk_index}): {full_url}")
 
+        # ── retry with exponential back-off ───────────────────────────────
         success = False
         for attempt in range(1, RETRY_LIMIT + 1):
             cmd = [
-                "curl",
-                full_url,
-                "-o",
-                chunk_filename,
-                "--http1.0",
-                "--silent",
-                "--show-error",
+                "curl", full_url,
+                "--http1.0", "--silent", "--show-error", "--fail",  # --fail ⇒ exit≠0 on 4xx/5xx
+                "-o", chunk_fn,
             ]
             try:
-                proc = subprocess.run(cmd, check=True, stderr=subprocess.PIPE)
-                if proc.returncode == 0 and os.path.getsize(chunk_filename) == 0:
-                    print(f"⚠️ Empty data for chunk #{chunk_index} ({current}-{chunk_end})")
+                subprocess.run(cmd, check=True, stderr=subprocess.PIPE)
                 success = True
                 break
             except subprocess.CalledProcessError as cpe:
-                stderr = cpe.stderr.decode(errors="ignore").strip()
-                print(
-                    f"⚠️ Curl attempt {attempt} failed for measurement {measurement_id} "
-                    f"(chunk {current}-{chunk_end}): {stderr}"
-                )
+                err = cpe.stderr.decode(errors="ignore").strip()
+                print(f"⚠️  Attempt {attempt}/{RETRY_LIMIT} failed: {err}")
                 time.sleep(2 ** attempt)
             except Exception as e:
-                print(
-                    f"⚠️ Unexpected error on curl attempt {attempt} "
-                    f"for measurement {measurement_id}: {e}"
-                )
+                print(f"⚠️  Unexpected error: {e}")
                 time.sleep(2 ** attempt)
 
         if not success:
             raise RuntimeError(
-                f"All {RETRY_LIMIT} curl attempts failed for "
-                f"{measurement_id} chunk {current}-{chunk_end}"
+                f"All {RETRY_LIMIT} curl attempts failed "
+                f"for measurement {measurement_id} ({current_ts}-{chunk_end_ts})"
             )
 
-        with open(chunk_filename, "rb") as src, gzip.open(final_fn, "ab") as dest:
-            dest.write(src.read())
+        # ── check whether this chunk is empty (i.e., exactly "[]\n") ─────
+        with open(chunk_fn, "rb") as cf:
+            chunk_bytes = cf.read()
+        if chunk_bytes.strip() in (b"[]", b""):
+            # Nothing inside → just drop it
+            os.remove(chunk_fn)
+        else:
+            # First time we see real data ⇒ start/continue gzip file
+            with gzip.open(final_fn, "ab") as gz_out:
+                gz_out.write(chunk_bytes)
+            wrote_data = True
+            os.remove(chunk_fn)
 
-        os.remove(chunk_filename)
-        current = chunk_end + 1
+        # next slice
+        current_ts  = chunk_end_ts + 1
         chunk_index += 1
 
+    # ── tidy up ──────────────────────────────────────────────────────────
+    if not wrote_data:
+        # Either no file was created, or it is also empty: ensure deletion
+        if os.path.exists(final_fn):
+            os.remove(final_fn)
+        print(f"🚮  {measurement_id}: all chunks empty – file removed.")
+    else:
+        print(f"✅  Completed {measurement_id}.jsonl.gz")
+
+    # Remove temp dir if it is empty
     if not os.listdir(temp_dir):
         os.rmdir(temp_dir)
-
-    print(f"✅ Completed {measurement_id}.jsonl.gz")
 
 
 def main(date_str: str, out_dir: str, builtin: bool) -> None:
