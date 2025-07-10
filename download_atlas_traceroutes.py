@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import gzip
 import time
 import argparse
 import requests  # used only for listing measurement IDs, not for downloading chunks
@@ -68,7 +69,7 @@ def fetch_and_save_results_curl(
     Use `curl --http1.0` to download RIPE Atlas chunked results in JSONL format.
 
     Each chunk is saved to a temporary file in a `. _temp_chunks` subdirectory, then appended to
-    `<out_dir>/<measurement_id>.jsonl`. Retries on failure up to RETRY_LIMIT. Removes temporary files
+    `<out_dir>/<measurement_id>.jsonl.gz`. Retries on failure up to RETRY_LIMIT. Removes temporary files
     when done.
 
     :param measurement_id: The RIPE Atlas measurement ID to fetch.
@@ -79,30 +80,26 @@ def fetch_and_save_results_curl(
     :type stop_ts: int
     :param out_dir: Directory where result files and temporary chunks are saved.
     :type out_dir: str
-    :return: None. On success, writes a `<measurement_id>.jsonl` file in out_dir.
+    :return: None. On success, writes a `<measurement_id>.jsonl.gz` file in out_dir.
     :rtype: None
     :raises RuntimeError: If all curl attempts fail for any chunk.
     """
-
-    final_fn = os.path.join(out_dir, f"{measurement_id}.jsonl")
+    final_fn = os.path.join(out_dir, f"{measurement_id}.jsonl.gz")
     temp_dir = os.path.join(out_dir, "._temp_chunks")
     os.makedirs(temp_dir, exist_ok=True)
 
-    # If a final file already exists, skip downloading.
     if os.path.exists(final_fn):
         print(f"⏭️ Skipping {measurement_id}, {final_fn} already exists.")
         return
 
-    # Remove any leftover temp chunks from a previous run
     for f in os.listdir(temp_dir):
         if f.startswith(f"chunk_{measurement_id}_"):
             os.remove(os.path.join(temp_dir, f))
 
-    interval = CHUNK_DURATION * 3600  # 6-hour chunks
+    interval = CHUNK_DURATION * 3600
     current = start_ts
     chunk_index = 0
 
-    # Ensure the final file is empty (in case this run was aborted halfway)
     if os.path.exists(final_fn):
         os.remove(final_fn)
 
@@ -120,7 +117,6 @@ def fetch_and_save_results_curl(
 
         success = False
         for attempt in range(1, RETRY_LIMIT + 1):
-            # Build the curl command
             cmd = [
                 "curl",
                 full_url,
@@ -132,9 +128,7 @@ def fetch_and_save_results_curl(
             ]
             try:
                 proc = subprocess.run(cmd, check=True, stderr=subprocess.PIPE)
-                # If HTTP status is 404, curl will return exit code 22: we interpret as “no data”
                 if proc.returncode == 0 and os.path.getsize(chunk_filename) == 0:
-                    # Empty file means no data in this interval
                     print(f"⚠️ Empty data for chunk #{chunk_index} ({current}-{chunk_end})")
                 success = True
                 break
@@ -158,21 +152,17 @@ def fetch_and_save_results_curl(
                 f"{measurement_id} chunk {current}-{chunk_end}"
             )
 
-        # Append this chunk to the final file (even if empty)
-        with open(chunk_filename, "rb") as src, open(final_fn, "ab") as dest:
+        with open(chunk_filename, "rb") as src, gzip.open(final_fn, "ab") as dest:
             dest.write(src.read())
 
-        # Remove the temporary chunk file to save space
         os.remove(chunk_filename)
-
         current = chunk_end + 1
         chunk_index += 1
 
-    # Clean up temp directory if empty
     if not os.listdir(temp_dir):
         os.rmdir(temp_dir)
 
-    print(f"✅ Completed {measurement_id}.jsonl")
+    print(f"✅ Completed {measurement_id}.jsonl.gz")
 
 
 def main(date_str: str, out_dir: str, builtin: bool) -> None:
@@ -231,7 +221,7 @@ if __name__ == "__main__":
         description="Download RIPE Atlas public traceroutes for a given UTC date using curl"
     )
     parser.add_argument(
-        "--date", "-d", default="2024-11-17",
+        "--date", "-d", default="2024-05-30",
         help="Date in YYYY-MM-DD (UTC) to fetch results for"
     )
     parser.add_argument(
